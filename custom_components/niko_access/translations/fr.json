@@ -1,0 +1,94 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Compte cloud Niko Access",
+        "description": "Connectez-vous avec le même compte que dans l'application Niko Access Control.",
+        "data": {
+          "username": "E-mail ou numéro de téléphone",
+          "password": "Mot de passe"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Ré-authentifier Niko Access",
+        "description": "Saisissez à nouveau le mot de passe pour {username}.",
+        "data": {
+          "password": "Mot de passe"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Compte ou mot de passe incorrect.",
+      "verification_required": "Le cloud demande une étape de vérification supplémentaire (captcha ou SMS). Connectez-vous une fois dans l'application Niko sur votre téléphone, puis réessayez.",
+      "cannot_connect": "Impossible de joindre le cloud Niko. Consultez les journaux."
+    },
+    "abort": {
+      "already_configured": "Ce compte est déjà configuré.",
+      "reauth_successful": "Ré-authentification réussie."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Options Niko Access",
+        "data": {
+          "lock_ids": "ID de serrures (séparés par des virgules, vide = auto)",
+          "scan_interval": "Intervalle d'interrogation de la sonnette (secondes)",
+          "camera_ip": "Adresse IP de la platine de rue (active la vidéo)",
+          "camera_channel": "Canal caméra",
+          "camera_quality": "Qualité du flux"
+        },
+        "data_description": {
+          "lock_ids": "Vide : un bouton « Ouvrir la porte » par serrure activée sur la platine. Sinon p. ex. 3 ou 1,3 (ID 1-4 : serrures platine A/B, relais système A/B).",
+          "scan_interval": "Fréquence à laquelle le cloud est interrogé sur un appel. Plus bas = plus rapide mais plus lourd pour le cloud.",
+          "camera_ip": "IP LAN de la platine (p. ex. 10.6.2.6). Détectée automatiquement sur votre réseau ; laisser vide désactive la caméra. Home Assistant doit être sur le même LAN. Utilisez une réservation DHCP pour un adressage stable.",
+          "camera_quality": "« main » = pleine résolution (H.264 1280x720), « sub » = sous-flux allégé."
+        }
+      }
+    },
+    "error": {
+      "invalid_lock_ids": "Saisissez des nombres séparés par des virgules, p. ex. 3 ou 1,3, ou laissez vide.",
+      "invalid_ip": "Saisissez une adresse IP valide, p. ex. 10.6.2.6, ou laissez vide."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "ringing": {
+        "name": "Sonne"
+      }
+    },
+    "button": {
+      "open_door": {
+        "name": "Ouvrir la porte {door}"
+      }
+    },
+    "event": {
+      "doorbell": {
+        "name": "Sonnette",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "ring": "Sonnerie"
+            }
+          }
+        }
+      }
+    },
+    "sensor": {
+      "call_state": {
+        "name": "État de l'appel",
+        "state": {
+          "idle": "Inactif",
+          "ringing": "Sonne",
+          "in_call": "En communication",
+          "unknown": "Inconnu"
+        }
+      }
+    },
+    "camera": {
+      "camera": {
+        "name": "Vidéo en direct"
+      }
+    }
+  }
+}

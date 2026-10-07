@@ -1,0 +1,7 @@
+# Dev instance for the niko_access custom integration.
+default_config:
+
+logger:
+  default: info
+  logs:
+    custom_components.niko_access: debug

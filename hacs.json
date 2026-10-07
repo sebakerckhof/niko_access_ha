@@ -1,0 +1,7 @@
+{
+  "name": "Niko Access Control (2-wire)",
+  "homeassistant": "2025.8.0",
+  "render_readme": true,
+  "zip_release": false,
+  "hide_default_branch": true
+}

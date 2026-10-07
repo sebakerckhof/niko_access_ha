@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Set up Python
+        run: uv python install 3.13
+      - name: Create venv and install deps
+        run: |
+          uv venv
+          uv pip install ruff pytest-homeassistant-custom-component \
+            pycryptodome cryptography xmltodict ha-ffmpeg PyTurboJPEG
+      - name: Ruff
+        run: uv run ruff check custom_components tests
+      - name: Pytest
+        run: uv run pytest -q

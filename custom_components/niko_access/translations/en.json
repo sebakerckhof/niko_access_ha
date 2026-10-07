@@ -1,0 +1,94 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Niko Access cloud account",
+        "description": "Log in with the same account you use in the Niko Access Control app.",
+        "data": {
+          "username": "E-mail or phone number",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate Niko Access",
+        "description": "Enter the password for {username} again.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Wrong account or password.",
+      "verification_required": "The cloud wants an extra verification step (captcha or SMS). Log in once in the Niko app on your phone, then try again.",
+      "cannot_connect": "Could not reach the Niko cloud. Check the logs for details."
+    },
+    "abort": {
+      "already_configured": "This account is already configured.",
+      "reauth_successful": "Re-authentication successful."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Niko Access options",
+        "data": {
+          "lock_ids": "Lock IDs (comma separated, leave empty for auto)",
+          "scan_interval": "Doorbell poll interval (seconds)",
+          "camera_ip": "Door station IP address (enables live video)",
+          "camera_channel": "Camera channel",
+          "camera_quality": "Stream quality"
+        },
+        "data_description": {
+          "lock_ids": "Empty: one 'Open door' button per lock marked enabled on the door station. Otherwise e.g. 3 or 1,3 (IDs 1-4: station locks A/B, system relays A/B).",
+          "scan_interval": "How often the cloud is asked whether someone is ringing. Lower is faster but heavier on the cloud.",
+          "camera_ip": "LAN IP of the door station (e.g. 10.6.2.6). Auto-detected on your network; leave empty to disable the camera. Home Assistant must be on the same LAN. Use a DHCP reservation so the address stays stable.",
+          "camera_quality": "'main' = full resolution (H.264 1280x720), 'sub' = lighter substream."
+        }
+      }
+    },
+    "error": {
+      "invalid_lock_ids": "Enter numbers separated by commas, e.g. 3 or 1,3, or leave empty.",
+      "invalid_ip": "Enter a valid IP address, e.g. 10.6.2.6, or leave empty."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "ringing": {
+        "name": "Ringing"
+      }
+    },
+    "button": {
+      "open_door": {
+        "name": "Open door {door}"
+      }
+    },
+    "event": {
+      "doorbell": {
+        "name": "Doorbell",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "ring": "Ring"
+            }
+          }
+        }
+      }
+    },
+    "sensor": {
+      "call_state": {
+        "name": "Call state",
+        "state": {
+          "idle": "Idle",
+          "ringing": "Ringing",
+          "in_call": "In call",
+          "unknown": "Unknown"
+        }
+      }
+    },
+    "camera": {
+      "camera": {
+        "name": "Live video"
+      }
+    }
+  }
+}

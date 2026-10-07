@@ -1,0 +1,30 @@
+[project]
+name = "niko-access"
+version = "0.1.0"
+description = "Home Assistant integration for the Niko Access Control 2-wire door system (Hikvision OEM)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "AGPL-3.0-or-later" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# Vendored third-party CPD7 library (MIT, rtammekivi/hikconnect_intercom) — not linted.
+extend-exclude = [
+  "custom_components/niko_access/cpd7/cas.py",
+  "custom_components/niko_access/cpd7/crypto.py",
+  "custom_components/niko_access/cpd7/hik_decoder.py",
+  "custom_components/niko_access/cpd7/lan_client.py",
+  "custom_components/niko_access/cpd7/_const.py",
+  ".vendor",
+  "dev",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I", "ASYNC", "SIM"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+

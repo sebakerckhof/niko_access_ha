@@ -1,0 +1,15 @@
+# Local Home Assistant with the integration mounted live.
+#   docker compose up -d     -> http://localhost:8123
+#   docker compose restart   -> pick up code changes
+services:
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: niko-access-ha
+    ports:
+      - "8123:8123"
+    volumes:
+      - ./dev/config:/config
+      - ./custom_components/niko_access:/config/custom_components/niko_access:ro
+    environment:
+      - TZ=Europe/Brussels
+    restart: unless-stopped

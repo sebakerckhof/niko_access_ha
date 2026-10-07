@@ -1,0 +1,17 @@
+__pycache__/
+.venv/
+.ruff_cache/
+.pytest_cache/
+# dev HA state (keep only configuration.yaml)
+dev/config/*
+!dev/config/configuration.yaml
+.vendor/
+
+# Root brand/ working folder (sources: .ai/.svg + exports) — not shipped.
+/brand/
+
+# Dev/RE artifacts — kept local, not published (contain device identifiers).
+scripts/
+FINDINGS.md
+STATUS.md
+STREAMING.md

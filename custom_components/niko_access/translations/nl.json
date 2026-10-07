@@ -1,0 +1,94 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Niko Access cloud-account",
+        "description": "Meld je aan met hetzelfde account als in de Niko Access Control-app.",
+        "data": {
+          "username": "E-mailadres of telefoonnummer",
+          "password": "Wachtwoord"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Niko Access opnieuw aanmelden",
+        "description": "Geef opnieuw het wachtwoord op voor {username}.",
+        "data": {
+          "password": "Wachtwoord"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Verkeerd account of wachtwoord.",
+      "verification_required": "De cloud vraagt een extra verificatiestap (captcha of sms). Meld je eenmalig aan in de Niko-app op je telefoon en probeer opnieuw.",
+      "cannot_connect": "Kon de Niko-cloud niet bereiken. Bekijk de logs voor details."
+    },
+    "abort": {
+      "already_configured": "Dit account is al geconfigureerd.",
+      "reauth_successful": "Opnieuw aanmelden geslaagd."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Niko Access-opties",
+        "data": {
+          "lock_ids": "Slot-ID's (komma-gescheiden, leeg = automatisch)",
+          "scan_interval": "Polling-interval deurbel (seconden)",
+          "camera_ip": "IP-adres buitenpost (schakelt live video in)",
+          "camera_channel": "Camerakanaal",
+          "camera_quality": "Streamkwaliteit"
+        },
+        "data_description": {
+          "lock_ids": "Leeg: één 'Deur openen'-knop per slot dat op de buitenpost is ingeschakeld. Anders bv. 3 of 1,3 (ID's 1-4: postsloten A/B, systeemrelais A/B).",
+          "scan_interval": "Hoe vaak de cloud wordt gevraagd of er wordt aangebeld. Lager is sneller maar zwaarder voor de cloud.",
+          "camera_ip": "LAN-IP van de buitenpost (bv. 10.6.2.6). Wordt automatisch gedetecteerd op je netwerk; leeg laten schakelt de camera uit. Home Assistant moet op hetzelfde LAN zitten. Gebruik een DHCP-reservering zodat het adres stabiel blijft.",
+          "camera_quality": "'main' = volledige resolutie (H.264 1280x720), 'sub' = lichtere substream."
+        }
+      }
+    },
+    "error": {
+      "invalid_lock_ids": "Geef getallen gescheiden door komma's, bv. 3 of 1,3, of laat leeg.",
+      "invalid_ip": "Geef een geldig IP-adres, bv. 10.6.2.6, of laat leeg."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "ringing": {
+        "name": "Belt aan"
+      }
+    },
+    "button": {
+      "open_door": {
+        "name": "Deur {door} openen"
+      }
+    },
+    "event": {
+      "doorbell": {
+        "name": "Deurbel",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "ring": "Belt aan"
+            }
+          }
+        }
+      }
+    },
+    "sensor": {
+      "call_state": {
+        "name": "Oproepstatus",
+        "state": {
+          "idle": "Inactief",
+          "ringing": "Belt aan",
+          "in_call": "In gesprek",
+          "unknown": "Onbekend"
+        }
+      }
+    },
+    "camera": {
+      "camera": {
+        "name": "Live video"
+      }
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "domain": "niko_access",
+  "name": "Niko Access Control (2-wire)",
+  "codeowners": [
+    "@sebakerckhof"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "ffmpeg"
+  ],
+  "documentation": "https://github.com/sebakerckhof/niko-access",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/sebakerckhof/niko-access/issues",
+  "loggers": [
+    "custom_components.niko_access"
+  ],
+  "requirements": [
+    "xmltodict"
+  ],
+  "version": "0.1.4"
+}

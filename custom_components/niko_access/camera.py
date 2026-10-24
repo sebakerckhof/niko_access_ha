@@ -48,6 +48,10 @@ _LINGER_SEC = 8.0
 _FRAME_TIMEOUT = 10.0
 _FIRST_FRAME_TIMEOUT = 15.0
 _MAX_EMPTY_READS = 40
+# The station drops the local stream while a ring is being set up. Viewers keep
+# their response open by repeating the last frame while the upstream reopens.
+_KEEPALIVE_SEC = 0.25
+_MAX_STALL_SEC = 90.0
 _MJPEG_BOUNDARY = "frame"
 
 
@@ -106,6 +110,7 @@ class _Cpd7Stream:
         self._pps = b""
         self._lock = asyncio.Lock()
         self._linger = None
+        self._reviving: asyncio.Task | None = None
 
     async def acquire(self) -> bool:
         async with self._lock:
@@ -128,6 +133,23 @@ class _Cpd7Stream:
             self._linger = loop.call_later(
                 _LINGER_SEC, lambda: asyncio.create_task(self._linger_teardown())
             )
+
+    @property
+    def alive(self) -> bool:
+        return self._proc is not None and not any(t.done() for t in self._tasks)
+
+    def revive(self) -> None:
+        """Reopen the upstream in the background, keeping the current viewers."""
+        if self._reviving is None or self._reviving.done():
+            self._reviving = asyncio.create_task(self._revive())
+
+    async def _revive(self) -> None:
+        async with self._lock:
+            if not self._users:
+                return
+            _LOGGER.debug("reopening live feed for %s", self._serial)
+            await self._teardown()
+            await self._open()
 
     async def _linger_teardown(self) -> None:
         async with self._lock:
@@ -394,14 +416,30 @@ class NikoCamera(NikoAccessEntity, Camera):
             },
         )
         await response.prepare(request)
+        loop = asyncio.get_running_loop()
         seq = 0
+        jpeg: bytes | None = None
+        last_fresh = loop.time()
+        next_revive = 0.0
         try:
             while True:
-                got = await self._source.frame_after(seq, _FRAME_TIMEOUT)
-                if got is None:
+                got = await self._source.frame_after(seq, _KEEPALIVE_SEC)
+                now = loop.time()
+                if got is not None:
+                    seq, jpeg = got
+                    self._last = jpeg
+                    last_fresh = now
+                elif now - last_fresh >= _MAX_STALL_SEC:
                     break
-                seq, jpeg = got
-                self._last = jpeg
+                else:
+                    # Stalled: reopen the upstream (right away if it died),
+                    # giving each attempt time to reach its first keyframe.
+                    stalled = now - last_fresh >= _FRAME_TIMEOUT
+                    if now >= next_revive and (stalled or not self._source.alive):
+                        self._source.revive()
+                        next_revive = now + _FIRST_FRAME_TIMEOUT
+                    if jpeg is None:
+                        continue  # nothing to repeat yet
                 await response.write(
                     b"--" + _MJPEG_BOUNDARY.encode() + b"\r\n"
                     b"Content-Type: image/jpeg\r\n"

@@ -8,10 +8,10 @@
   "dependencies": [
     "ffmpeg"
   ],
-  "documentation": "https://github.com/sebakerckhof/niko-access",
+  "documentation": "https://github.com/sebakerckhof/niko_access_ha",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/sebakerckhof/niko-access/issues",
+  "issue_tracker": "https://github.com/sebakerckhof/niko_access_ha/issues",
   "loggers": [
     "custom_components.niko_access"
   ],

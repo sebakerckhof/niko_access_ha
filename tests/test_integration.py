@@ -22,7 +22,7 @@ from custom_components.niko_access.const import (
     DOMAIN,
 )
 
-from .conftest import API, EU, SERIAL, call_reply, devices_reply
+from .conftest import API, EU, SERIAL, call_reply, devices_reply, isapi_router, login_ok
 
 
 def entry_for(hass: HomeAssistant) -> MockConfigEntry:
@@ -142,6 +142,45 @@ async def test_ring_fires_event_once(hass, cloud):
     # Still ringing on the next poll: no second event.
     await poll()
     assert hass.states.get("event.external_unit_doorbell").state == first_fired
+
+
+async def _poll_with_call(hass, cloud, **reply):
+    cloud.clear_requests()
+    cloud.get(f"{EU}/v3/devconfig/v1/call/{SERIAL}/status", **reply)
+    cloud.get(f"{EU}/v3/userdevices/v1/devices/pagelist", json=devices_reply())
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=10))
+    await hass.async_block_till_done()
+
+
+CALL_ERROR = {"json": {"meta": {"code": 500, "message": "server error"}}}
+
+
+async def test_call_errors_never_stop_polling_known_intercom(hass, cloud):
+    entry = entry_for(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass.states.get("binary_sensor.external_unit_ringing").state == "off"
+
+    for _ in range(10):
+        await _poll_with_call(hass, cloud, **CALL_ERROR)
+    assert hass.states.get("binary_sensor.external_unit_ringing").state == "unknown"
+
+    await _poll_with_call(hass, cloud, json=call_reply(2))
+    assert hass.states.get("binary_sensor.external_unit_ringing").state == "on"
+
+
+async def test_transient_call_error_at_startup_keeps_polling(hass, aioclient_mock, cloud):
+    aioclient_mock.clear_requests()
+    aioclient_mock.post(f"{EU}/v3/users/login/v2", json=login_ok())
+    aioclient_mock.get(f"{EU}/v3/userdevices/v1/devices/pagelist", json=devices_reply())
+    aioclient_mock.get(f"{EU}/v3/devconfig/v1/call/{SERIAL}/status", **CALL_ERROR)
+    aioclient_mock.post(f"{EU}/api/device/isapi", side_effect=isapi_router)
+    entry = entry_for(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    await _poll_with_call(hass, cloud, json=call_reply(2))
+    assert entry.runtime_data.data[SERIAL].call.ringing
 
 
 async def test_camera_created_when_ip_set(hass, cloud):

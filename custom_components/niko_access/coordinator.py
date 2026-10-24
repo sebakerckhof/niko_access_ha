@@ -24,6 +24,10 @@ from .const import DEVICE_REFRESH_INTERVAL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
+# Consecutive call-status failures before an online device that has never
+# answered is treated as a non-intercom and no longer polled.
+_CALL_GIVE_UP = 5
+
 type NikoAccessConfigEntry = ConfigEntry[NikoAccessCoordinator]
 
 
@@ -57,6 +61,10 @@ class NikoAccessCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]):
         self._devices_at = None
         # Serials whose call endpoint is unsupported; stop polling them.
         self._no_call: set[str] = set()
+        # Serials that answered the call endpoint at least once (intercoms);
+        # these are always polled again, whatever errors follow.
+        self._has_call: set[str] = set()
+        self._call_failures: dict[str, int] = {}
         self._ring_listeners: list = []
 
     def async_add_ring_listener(self, callback) -> callable:
@@ -86,21 +94,34 @@ class NikoAccessCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]):
         return result
 
     async def _poll_call(self, device: NikoDevice) -> CallStatus | None:
+        serial = device.serial
         try:
-            return await self.client.get_call_status(device.serial)
+            call = await self.client.get_call_status(serial)
         except (NikoAccessAuthError, NikoAccessVerificationRequired):
             raise
         except NikoAccessError as err:
-            # Non-intercom devices (or unsupported firmware) reject this call.
-            # Keep the device but stop polling its call state if it is online.
-            if device.online:
+            if not device.online and serial not in self._has_call:
+                return None
+            failures = self._call_failures.get(serial, 0) + 1
+            self._call_failures[serial] = failures
+            if serial in self._has_call:
+                # A known intercom: a transient cloud error, retry next poll.
+                if failures == 1:
+                    _LOGGER.warning("Call status failed for %s: %s", serial, err)
+            elif failures >= _CALL_GIVE_UP:
+                # Non-intercom devices (or unsupported firmware) reject this
+                # call. Keep the device but stop polling its call state.
                 _LOGGER.info(
                     "Call status not available for %s (%s); not polling it further",
-                    device.serial,
+                    serial,
                     err,
                 )
-                self._no_call.add(device.serial)
+                self._no_call.add(serial)
             return None
+        if self._call_failures.pop(serial, 0) and serial in self._has_call:
+            _LOGGER.info("Call status for %s is available again", serial)
+        self._has_call.add(serial)
+        return call
 
     def _fire_ring_transitions(self, new: dict[str, DeviceState]) -> None:
         old = self.data or {}

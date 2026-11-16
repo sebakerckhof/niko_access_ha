@@ -11,6 +11,12 @@ unit on the wire is::
 
 Decode = strip framing -> drop 12+13 header -> standard RFC 6184 depacketize ->
 Annex-B H.264.  Verified against a DS-KH6320-WTE1: H.264 Baseline 1280x720 25fps.
+
+The 13-byte header is 0x0d followed by a nested RTP header.  Its payload type
+separates the video from the G.711 audio the station interleaves on the same
+channel (a Niko 510-31001 sends PT 0, u-law 8 kHz mono, 320 bytes per 40 ms), so
+audio is no longer depacketized as H.264.  ``take_media`` returns both per packet
+with the nested RTP timestamp and marker, for muxing with correct timing.
 """
 
 from __future__ import annotations
@@ -23,6 +29,8 @@ _LOGGER = logging.getLogger(__name__)
 _SC = b"\x00\x00\x00\x01"
 _RTP_HEADER = 12
 _HIK_HEADER = 13
+# Static RTP payload types (RFC 3551) of the nested header: G.711 u-law / A-law.
+_AUDIO_FORMATS = {0: "mulaw", 8: "alaw"}
 
 
 class HikStreamDecoder:
@@ -43,7 +51,10 @@ class HikStreamDecoder:
         self._marker = bytes([0x24, self._interleave])
         self._buf = bytearray()
         self._out = bytearray()
+        self._media: list[tuple[str, int, bool, bytes]] = []
         self._synced = False
+        # "mulaw" or "alaw" once the station sent audio.
+        self.audio_format: str | None = None
 
     @property
     def keys_derived(self) -> bool:  # parity with StreamDecoder API
@@ -59,6 +70,17 @@ class HikStreamDecoder:
     def take(self) -> bytes:
         out = bytes(self._out)
         self._out.clear()
+        return out
+
+    def take_media(self) -> list[tuple[str, int, bool, bytes]]:
+        """``(kind, rtp_ts, marker, data)`` per packet since the last call.
+
+        ``kind`` "v": the Annex-B bytes this packet added to ``take()``;
+        "a": raw G.711 audio (see ``audio_format``), which ``take()`` never holds.
+        Call it alongside ``take()``, or the list keeps growing.
+        """
+        out = self._media
+        self._media = []
         return out
 
     # -- internals --------------------------------------------------------
@@ -91,6 +113,15 @@ class HikStreamDecoder:
     def _handle_packet(self, packet: bytes) -> None:
         if len(packet) < _RTP_HEADER + _HIK_HEADER + 1:
             return
+        # Nested RTP header at packet[13:]: marker + payload type, timestamp.
+        marker_pt = packet[_RTP_HEADER + 2]
+        ts = struct.unpack(">I", packet[_RTP_HEADER + 5:_RTP_HEADER + 9])[0]
+        audio_format = _AUDIO_FORMATS.get(marker_pt & 0x7F)
+        if audio_format is not None:
+            self.audio_format = audio_format
+            self._media.append(("a", ts, True, packet[_RTP_HEADER + _HIK_HEADER:]))
+            return
+        start = len(self._out)
         pay = packet[_RTP_HEADER + _HIK_HEADER:]  # RFC 6184 payload
         t = pay[0] & 0x1F
         if 1 <= t <= 23:
@@ -110,3 +141,5 @@ class HikStreamDecoder:
                     break
                 self._out += _SC + pay[i:i + sz]
                 i += sz
+        if len(self._out) > start:
+            self._media.append(("v", ts, bool(marker_pt & 0x80), bytes(self._out[start:])))

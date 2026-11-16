@@ -26,6 +26,10 @@ CONF_CAMERA_QUALITY = "camera_quality"
 DEFAULT_CAMERA_CHANNEL = 1
 DEFAULT_CAMERA_QUALITY = "main"
 CAMERA_QUALITIES = ["main", "sub"]
+# Also offer the station's H.264 with its audio as a stream source (WebRTC/HLS
+# with sound in Home Assistant), next to the MJPEG feed.
+CONF_CAMERA_STREAM = "camera_stream"
+DEFAULT_CAMERA_STREAM = False
 
 # MJPEG transcode (ffmpeg H.264 -> JPEG) defaults.
 MJPEG_FPS = 8

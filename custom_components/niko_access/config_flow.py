@@ -33,12 +33,14 @@ from .const import (
     CONF_CAMERA_CHANNEL,
     CONF_CAMERA_IP,
     CONF_CAMERA_QUALITY,
+    CONF_CAMERA_STREAM,
     CONF_FEATURE_CODE,
     CONF_LOCK_IDS,
     CONF_PASSWORD_MD5,
     CONF_SCAN_INTERVAL,
     DEFAULT_CAMERA_CHANNEL,
     DEFAULT_CAMERA_QUALITY,
+    DEFAULT_CAMERA_STREAM,
     DEFAULT_LOCK_IDS,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
@@ -200,6 +202,7 @@ class NikoAccessOptionsFlow(OptionsFlowWithReload):
                 vol.Required(CONF_CAMERA_QUALITY, default=DEFAULT_CAMERA_QUALITY): vol.In(
                     CAMERA_QUALITIES
                 ),
+                vol.Required(CONF_CAMERA_STREAM, default=DEFAULT_CAMERA_STREAM): bool,
             }
         )
         return self.async_show_form(

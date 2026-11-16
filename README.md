@@ -22,10 +22,11 @@ through the Niko / Hik-Connect cloud with **local live video**.
 | 📞 Call state | `idle` / `ringing` / `in_call` sensor + a "ringing" binary sensor |
 | 🚪 Open door | one button per enabled lock on the station |
 | 📹 **Live video** | pulled **locally** from the station (H.264 → MJPEG); no admin password or RTSP needed |
+| 🔊 Live audio (optional) | the station's microphone, in a WebRTC/HLS stream with the original H.264 |
 | 🟢 Connectivity | cloud online/offline diagnostic |
 
-Not included: **two-way talk** (audio) — the media protocol is reverse-engineered
-but the cloud call-bridge step isn't reproduced yet.
+Not included: **two-way talk** (talking back to the station) — the media protocol
+is reverse-engineered but the cloud call-bridge step isn't reproduced yet.
 
 ## Requirements
 
@@ -57,9 +58,23 @@ restart.
    - **Lock IDs** — leave empty to expose the locks the station reports as
      enabled, or list them (e.g. `3` or `1,3`).
    - **Poll interval** and **stream quality** (`main` full-res / `sub` lighter).
+   - **Stream with audio** — see below.
 
 You get one device ("External unit") with the doorbell event, call-state and
 ringing sensors, the open-door button(s), and a **Live video** camera.
+
+### Stream with audio
+
+The station sends its microphone (G.711, 8 kHz) along with the video. With
+**Stream with audio** on, the camera also gets a stream source: the station's
+H.264, copied without re-encoding, plus the audio encoded to AAC, as MPEG-TS.
+Home Assistant's live view then uses WebRTC or HLS, with sound, instead of MJPEG,
+and integrations that use a camera's stream source (HomeKit, `camera.record`) get
+the audio too. Snapshots and the MJPEG feed stay as they are.
+
+Other tools on your network (go2rtc, Frigate, …) can read the same stream at
+`http://<home-assistant>:8123/api/niko_access/stream/<camera entity ID>` with a
+long-lived access token in an `Authorization: Bearer` header.
 
 ## How it works (short version)
 
@@ -68,7 +83,9 @@ Hik-Connect on the `guardingvision` OEM cloud. Ring/unlock/call-state go through
 that cloud API. Video is **not** cloud-relayed here: a per-device key is obtained
 from the cloud (no device password), then the H.264 stream is pulled directly
 from the station over the LAN (the "CPD7" protocol), de-framed in Python and
-transcoded to MJPEG.
+transcoded to MJPEG. The stream with audio wraps the same H.264 and the G.711
+audio in FLV, using the station's RTP timestamps, and ffmpeg turns that into
+MPEG-TS with AAC audio.
 
 ## Development
 

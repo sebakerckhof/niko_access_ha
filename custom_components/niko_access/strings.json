@@ -36,13 +36,15 @@
           "scan_interval": "Doorbell poll interval (seconds)",
           "camera_ip": "Door station IP address (enables live video)",
           "camera_channel": "Camera channel",
-          "camera_quality": "Stream quality"
+          "camera_quality": "Stream quality",
+          "camera_stream": "Stream with audio"
         },
         "data_description": {
           "lock_ids": "Empty: one 'Open door' button per lock marked enabled on the door station. Otherwise e.g. 3 or 1,3 (IDs 1-4: station locks A/B, system relays A/B).",
           "scan_interval": "How often the cloud is asked whether someone is ringing. Lower is faster but heavier on the cloud.",
           "camera_ip": "LAN IP of the door station (e.g. 10.6.2.6). Auto-detected on your network; leave empty to disable the camera. Home Assistant must be on the same LAN. Use a DHCP reservation so the address stays stable.",
-          "camera_quality": "'main' = full resolution (H.264 1280x720), 'sub' = lighter substream."
+          "camera_quality": "'main' = full resolution (H.264 1280x720), 'sub' = lighter substream.",
+          "camera_stream": "Also offer the station's own H.264 video with its microphone sound as a stream. Home Assistant then plays the camera over WebRTC or HLS, with sound. Off: MJPEG only, as before."
         }
       }
     },

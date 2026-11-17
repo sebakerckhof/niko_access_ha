@@ -36,13 +36,15 @@
           "scan_interval": "Intervalle d'interrogation de la sonnette (secondes)",
           "camera_ip": "Adresse IP de la platine de rue (active la vidéo)",
           "camera_channel": "Canal caméra",
-          "camera_quality": "Qualité du flux"
+          "camera_quality": "Qualité du flux",
+          "camera_stream": "Flux avec son"
         },
         "data_description": {
           "lock_ids": "Vide : un bouton « Ouvrir la porte » par serrure activée sur la platine. Sinon p. ex. 3 ou 1,3 (ID 1-4 : serrures platine A/B, relais système A/B).",
           "scan_interval": "Fréquence à laquelle le cloud est interrogé sur un appel. Plus bas = plus rapide mais plus lourd pour le cloud.",
           "camera_ip": "IP LAN de la platine (p. ex. 10.6.2.6). Détectée automatiquement sur votre réseau ; laisser vide désactive la caméra. Home Assistant doit être sur le même LAN. Utilisez une réservation DHCP pour un adressage stable.",
-          "camera_quality": "« main » = pleine résolution (H.264 1280x720), « sub » = sous-flux allégé."
+          "camera_quality": "« main » = pleine résolution (H.264 1280x720), « sub » = sous-flux allégé.",
+          "camera_stream": "Propose aussi la vidéo H.264 de la platine avec le son de son microphone comme flux. Home Assistant lit alors la caméra en WebRTC ou HLS, avec le son. Désactivé : MJPEG uniquement, comme avant."
         }
       }
     },

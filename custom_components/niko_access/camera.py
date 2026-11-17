@@ -4,6 +4,10 @@ The cloud only brokers a per-device control key (via CAS); the H.264 video is
 pulled directly from the station on ports 9010/9020, de-framed in pure Python
 (vendored `cpd7/`), and transcoded to MJPEG by ffmpeg for Home Assistant.
 
+With the "stream with audio" option, the camera also offers a stream source: the
+station's own H.264, copied, with its G.711 audio encoded to AAC, as MPEG-TS. Home
+Assistant then plays it over WebRTC/HLS with sound.
+
 The CPD7 pipeline (shared ffmpeg encoder, keyframe-aware feed) is adapted from
 rtammekivi/hikconnect_intercom (MIT); see THIRD_PARTY_LICENSES.md. It is enabled
 only when a camera IP is set in the integration options, since the cloud does
@@ -15,10 +19,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
 
 from aiohttp import web
-from homeassistant.components.camera import Camera
+from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.components.ffmpeg import get_ffmpeg_manager
+from homeassistant.components.http import KEY_AUTHENTICATED, HomeAssistantView
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
@@ -26,8 +32,11 @@ from .const import (
     CONF_CAMERA_CHANNEL,
     CONF_CAMERA_IP,
     CONF_CAMERA_QUALITY,
+    CONF_CAMERA_STREAM,
     DEFAULT_CAMERA_CHANNEL,
     DEFAULT_CAMERA_QUALITY,
+    DEFAULT_CAMERA_STREAM,
+    DOMAIN,
     MJPEG_FPS,
     MJPEG_HEIGHT,
     MJPEG_QUALITY,
@@ -38,6 +47,7 @@ from .cpd7.hik_decoder import HikStreamDecoder
 from .cpd7.lan_client import ControlKeyError, Cpd7LanClient
 from .discovery import async_find_ip
 from .entity import NikoAccessEntity
+from .flv import FlvMuxer
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,6 +63,12 @@ _MAX_EMPTY_READS = 40
 _KEEPALIVE_SEC = 0.25
 _MAX_STALL_SEC = 90.0
 _MJPEG_BOUNDARY = "frame"
+# Stream source (H.264 + audio as MPEG-TS).
+_NATIVE_QUEUE_MAX = 1000
+_NATIVE_WAIT_SEC = 1.0
+# How long a new stream waits to learn whether the station sends audio.
+_AUDIO_PROBE_SEC = 1.0
+_NATIVE_STREAMS = f"{DOMAIN}_native_streams"
 
 
 async def async_setup_entry(
@@ -66,11 +82,15 @@ async def async_setup_entry(
     coordinator = entry.runtime_data
     channel = int(entry.options.get(CONF_CAMERA_CHANNEL, DEFAULT_CAMERA_CHANNEL))
     quality = entry.options.get(CONF_CAMERA_QUALITY, DEFAULT_CAMERA_QUALITY)
+    native = entry.options.get(CONF_CAMERA_STREAM, DEFAULT_CAMERA_STREAM)
+    if native and _NATIVE_STREAMS not in hass.data:
+        hass.data[_NATIVE_STREAMS] = {}
+        hass.http.register_view(_NativeStreamView(hass.data[_NATIVE_STREAMS]))
     # One camera per device that answered the call endpoint (the door station).
     serials = [s for s, st in coordinator.data.items() if st.call is not None]
     serials = serials or list(coordinator.data)
     async_add_entities(
-        NikoCamera(coordinator, serial, ip, channel, quality) for serial in serials
+        NikoCamera(coordinator, serial, ip, channel, quality, native) for serial in serials
     )
 
 
@@ -111,6 +131,9 @@ class _Cpd7Stream:
         self._lock = asyncio.Lock()
         self._linger = None
         self._reviving: asyncio.Task | None = None
+        # Stream-source consumers: queues of (arrival time, take_media() list).
+        self._feeds: set[asyncio.Queue] = set()
+        self._audio_format: str | None = None
 
     async def acquire(self) -> bool:
         async with self._lock:
@@ -133,6 +156,23 @@ class _Cpd7Stream:
             self._linger = loop.call_later(
                 _LINGER_SEC, lambda: asyncio.create_task(self._linger_teardown())
             )
+
+    async def subscribe(self) -> asyncio.Queue | None:
+        """Open (or join) the upstream and receive its decoded media packets."""
+        if not await self.acquire():
+            return None
+        feed: asyncio.Queue = asyncio.Queue(maxsize=_NATIVE_QUEUE_MAX)
+        self._feeds.add(feed)
+        return feed
+
+    async def unsubscribe(self, feed: asyncio.Queue) -> None:
+        self._feeds.discard(feed)
+        await self.release()
+
+    @property
+    def audio_format(self) -> str | None:
+        """G.711 variant ("mulaw"/"alaw") once the station sent audio."""
+        return self._audio_format
 
     @property
     def alive(self) -> bool:
@@ -268,6 +308,14 @@ class _Cpd7Stream:
                     continue
                 empty = 0
                 decoder.feed(buf)
+                media = decoder.take_media()
+                if decoder.audio_format:
+                    self._audio_format = decoder.audio_format
+                if media and self._feeds:
+                    item = (asyncio.get_running_loop().time(), media)
+                    for feed in self._feeds:
+                        with contextlib.suppress(asyncio.QueueFull):
+                            feed.put_nowait(item)
                 h = decoder.take()
                 if not h:
                     continue
@@ -383,6 +431,7 @@ class NikoCamera(NikoAccessEntity, Camera):
         ip: str,
         channel: int,
         quality: str,
+        native: bool = False,
     ) -> None:
         NikoAccessEntity.__init__(self, coordinator, serial, "camera")
         Camera.__init__(self)
@@ -390,6 +439,28 @@ class NikoCamera(NikoAccessEntity, Camera):
             coordinator.hass, coordinator, serial, ip, channel, quality
         )
         self._last: bytes | None = None
+        self._native = native
+        self._token = secrets.token_urlsafe(32)
+        if native:
+            self._attr_supported_features = CameraEntityFeature.STREAM
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self._native:
+            self.hass.data[_NATIVE_STREAMS][self._token] = self
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._native:
+            self.hass.data[_NATIVE_STREAMS].pop(self._token, None)
+        await super().async_will_remove_from_hass()
+
+    async def stream_source(self) -> str | None:
+        """The stream served by _NativeStreamView; its token is the credential."""
+        api = self.hass.config.api
+        if not self._native or api is None:
+            return None
+        scheme = "https" if api.use_ssl else "http"
+        return f"{scheme}://127.0.0.1:{api.port}/api/{DOMAIN}/stream/{self._token}"
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
@@ -451,3 +522,128 @@ class NikoCamera(NikoAccessEntity, Camera):
         finally:
             await self._source.release()
         return response
+
+    async def handle_native_stream(self, request: web.Request) -> web.StreamResponse:
+        """The station's H.264 (copied) and G.711 audio (encoded to AAC) as MPEG-TS."""
+        feed = await self._source.subscribe()
+        if feed is None:
+            return web.Response(status=503, text="no live feed")
+        response = web.StreamResponse(status=200, headers={"Content-Type": "video/mp2t"})
+        loop = asyncio.get_running_loop()
+        probe_until = loop.time() + _AUDIO_PROBE_SEC
+        last_fresh = loop.time()
+        next_revive = 0.0
+        pending: list = []
+        muxer: FlvMuxer | None = None
+        proc: asyncio.subprocess.Process | None = None
+        copy: asyncio.Task | None = None
+        try:
+            await response.prepare(request)
+            proc = await _start_native_ffmpeg(self.hass)
+            if proc is None:
+                return response
+            copy = asyncio.create_task(_copy_output(proc, response))
+            while not copy.done():
+                try:
+                    item = await asyncio.wait_for(feed.get(), _NATIVE_WAIT_SEC)
+                except TimeoutError:
+                    item = None
+                now = loop.time()
+                if item is None:
+                    if now - last_fresh >= _MAX_STALL_SEC:
+                        break
+                    # Stalled: reopen the upstream, as for MJPEG viewers.
+                    stalled = now - last_fresh >= _FRAME_TIMEOUT
+                    if now >= next_revive and (stalled or not self._source.alive):
+                        self._source.revive()
+                        next_revive = now + _FIRST_FRAME_TIMEOUT
+                    continue
+                last_fresh = now
+                pending.append(item)
+                if muxer is None:
+                    # Packets carry their own timing, so they can wait until it is
+                    # known whether the station sends audio.
+                    if self._source.audio_format is None and now < probe_until:
+                        continue
+                    muxer = FlvMuxer(self._source.audio_format)
+                data = b"".join(
+                    muxer.audio(ts, payload, at)
+                    if kind == "a"
+                    else muxer.video(ts, marker, payload, at)
+                    for at, media in pending
+                    for kind, ts, marker, payload in media
+                )
+                pending.clear()
+                if data:
+                    proc.stdin.write(data)
+                    await proc.stdin.drain()
+        except (
+            BrokenPipeError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            asyncio.CancelledError,
+        ):
+            pass
+        finally:
+            if copy is not None:
+                copy.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await copy
+            if proc is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()
+            await self._source.unsubscribe(feed)
+        return response
+
+
+async def _start_native_ffmpeg(hass: HomeAssistant) -> asyncio.subprocess.Process | None:
+    """ffmpeg reading FLV on stdin and writing MPEG-TS (video copied, audio as AAC)."""
+    try:
+        return await asyncio.create_subprocess_exec(
+            get_ffmpeg_manager(hass).binary, "-loglevel", "error",
+            "-analyzeduration", "500000", "-f", "flv", "-i", "pipe:0",
+            "-map", "0:v", "-map", "0:a?", "-c:v", "copy",
+            "-c:a", "aac", "-ar", "16000", "-b:a", "32k",
+            "-f", "mpegts", "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError as err:
+        _LOGGER.warning("ffmpeg failed to start for the stream source: %s", err)
+        return None
+
+
+async def _copy_output(proc: asyncio.subprocess.Process, response: web.StreamResponse) -> None:
+    try:
+        while chunk := await proc.stdout.read(64 * 1024):
+            await response.write(chunk)
+    finally:
+        # Unblock the writer when the viewer left or ffmpeg stopped.
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+
+
+class _NativeStreamView(HomeAssistantView):
+    """Serves the cameras' stream sources.
+
+    Home Assistant's stream worker and go2rtc open ``stream_source()`` without
+    credentials, so that URL carries a random per-camera token. Other tools can
+    open the same stream by entity ID with a Home Assistant access token.
+    """
+
+    url = f"/api/{DOMAIN}/stream/{{key}}"
+    name = f"api:{DOMAIN}:stream"
+    requires_auth = False
+
+    def __init__(self, cameras: dict[str, NikoCamera]) -> None:
+        self._cameras = cameras
+
+    async def get(self, request: web.Request, key: str) -> web.StreamResponse:
+        camera = self._cameras.get(key)
+        if camera is None and request.get(KEY_AUTHENTICATED):
+            camera = next((c for c in self._cameras.values() if c.entity_id == key), None)
+        if camera is None:
+            return web.Response(status=404)
+        return await camera.handle_native_stream(request)

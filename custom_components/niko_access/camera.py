@@ -97,7 +97,11 @@ async def async_setup_entry(
 
 
 class _Cpd7Stream:
-    """One CPD7 upstream + one ffmpeg encoder, shared by all viewers.
+    """One CPD7 upstream + one ffmpeg MJPEG encoder, shared by all viewers.
+
+    The encoder runs only while someone watches MJPEG or takes a snapshot.
+    Stream-source consumers get the station's packets as they are, so they do
+    not need it.
 
     Adapted from hikconnect_intercom's _ChannelStream, decoupled from its
     coordinators: the station IP and the CAS key come from this integration.
@@ -123,8 +127,13 @@ class _Cpd7Stream:
         self._proc: asyncio.subprocess.Process | None = None
         self._queue: asyncio.Queue | None = None
         self._tasks: list[asyncio.Task] = []
+        self._encoder_tasks: list[asyncio.Task] = []
         self._stopping = False
         self._users = 0
+        # Users that need the MJPEG encoder (viewers and snapshots).
+        self._mjpeg_users = 0
+        # The encoder joined a running upstream: feed it from the next keyframe.
+        self._await_rap = False
         self._jpeg: bytes | None = None
         self._seq = 0
         self._waiters: set[asyncio.Event] = set()
@@ -137,25 +146,46 @@ class _Cpd7Stream:
         self._feeds: set[asyncio.Queue] = set()
         self._audio_format: str | None = None
 
-    async def acquire(self) -> bool:
+    async def acquire(self, *, mjpeg: bool = True) -> bool:
+        """Open (or join) the upstream; with ``mjpeg`` also its MJPEG encoder."""
         async with self._lock:
             if self._linger is not None:
                 self._linger.cancel()
                 self._linger = None
-            if self._proc is not None and any(t.done() for t in self._tasks):
+            if self._lan is not None and any(t.done() for t in self._tasks):
                 await self._teardown()
-            if self._proc is None and not await self._open():
-                return False
-            self._users += 1
-            return True
+            if mjpeg:
+                self._mjpeg_users += 1
+            if self._lan is None:
+                opened = await self._open()
+            else:
+                opened = (
+                    not mjpeg
+                    or self._proc is not None
+                    or await self._start_encoder(midstream=True)
+                )
+            if opened:
+                self._users += 1
+            elif mjpeg:
+                self._mjpeg_users -= 1
+            self._schedule_linger()
+            return opened
 
-    async def release(self) -> None:
+    async def release(self, *, mjpeg: bool = True) -> None:
         async with self._lock:
             self._users = max(0, self._users - 1)
-            if self._users or self._proc is None:
-                return
-            loop = asyncio.get_running_loop()
-            self._linger = loop.call_later(
+            if mjpeg:
+                self._mjpeg_users = max(0, self._mjpeg_users - 1)
+            self._schedule_linger()
+
+    def _schedule_linger(self) -> None:
+        """(Re)arm the timer that closes what nobody uses any more."""
+        if self._linger is not None:
+            self._linger.cancel()
+            self._linger = None
+        idle_encoder = self._proc is not None and not self._mjpeg_users
+        if self._lan is not None and (not self._users or idle_encoder):
+            self._linger = asyncio.get_running_loop().call_later(
                 _LINGER_SEC, lambda: asyncio.create_task(self._linger_teardown())
             )
 
@@ -165,7 +195,7 @@ class _Cpd7Stream:
         A consumer that falls a full queue behind loses its backlog and gets
         ``_FEED_RESET``: it has to continue at the next keyframe.
         """
-        if not await self.acquire():
+        if not await self.acquire(mjpeg=False):
             return None
         feed: asyncio.Queue = asyncio.Queue(maxsize=_NATIVE_QUEUE_MAX)
         self._feeds.add(feed)
@@ -173,7 +203,7 @@ class _Cpd7Stream:
 
     async def unsubscribe(self, feed: asyncio.Queue) -> None:
         self._feeds.discard(feed)
-        await self.release()
+        await self.release(mjpeg=False)
 
     def _publish_media(self, media: list) -> None:
         item = (asyncio.get_running_loop().time(), media)
@@ -191,7 +221,7 @@ class _Cpd7Stream:
 
     @property
     def alive(self) -> bool:
-        return self._proc is not None and not any(t.done() for t in self._tasks)
+        return self._lan is not None and not any(t.done() for t in self._tasks)
 
     def revive(self) -> None:
         """Reopen the upstream in the background, keeping the current viewers."""
@@ -211,6 +241,8 @@ class _Cpd7Stream:
             self._linger = None
             if not self._users:
                 await self._teardown()
+            elif not self._mjpeg_users:
+                await self._stop_encoder()
 
     @property
     def latest(self) -> tuple[int, bytes] | None:
@@ -280,35 +312,48 @@ class _Cpd7Stream:
         lan = await self._open_lan()
         if lan is None:
             return False
+        self._lan = lan
+        self._stopping = False
+        if self._mjpeg_users and not await self._start_encoder():
+            await self._teardown()
+            return False
+        self._tasks.append(asyncio.create_task(self._pump_loop()))
+        return True
+
+    async def _start_encoder(self, *, midstream: bool = False) -> bool:
+        """Start the MJPEG encoder; ``midstream`` when the upstream already runs."""
         try:
-            proc = await asyncio.create_subprocess_exec(
-                get_ffmpeg_manager(self._hass).binary, "-loglevel", "error",
-                "-fflags", "+discardcorrupt", "-f", "h264", "-i", "pipe:0",
-                "-an", "-c:v", "mjpeg", "-q:v", str(MJPEG_QUALITY), "-r", str(MJPEG_FPS),
-                "-vf", f"scale={MJPEG_WIDTH}:{MJPEG_HEIGHT}",
-                "-f", "image2pipe", "pipe:1",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
+            proc = await _start_mjpeg_ffmpeg(self._hass)
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("ffmpeg failed to start for %s: %s", self._serial, err)
-            with contextlib.suppress(Exception):
-                await self._hass.async_add_executor_job(lan.close)
             return False
-        self._lan = lan
         self._proc = proc
-        self._stopping = False
         self._jpeg = None
-        self._queue = asyncio.Queue(maxsize=_FEED_QUEUE_MAX)
+        self._queue = queue = asyncio.Queue(maxsize=_FEED_QUEUE_MAX)
+        self._await_rap = midstream
         if self._sps and self._pps:
-            self._queue.put_nowait((False, self._sps + self._pps))
-        self._tasks = [
-            asyncio.create_task(self._pump_loop()),
-            asyncio.create_task(self._feed_loop()),
-            asyncio.create_task(self._read_loop()),
+            queue.put_nowait((False, self._sps + self._pps))
+        self._encoder_tasks = [
+            asyncio.create_task(self._feed_loop(proc, queue)),
+            asyncio.create_task(self._read_loop(proc)),
         ]
+        self._tasks += self._encoder_tasks
         return True
+
+    async def _stop_encoder(self) -> None:
+        """Stop the MJPEG encoder and leave the upstream to its other consumers."""
+        tasks, self._encoder_tasks = self._encoder_tasks, []
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._tasks = [task for task in self._tasks if task not in tasks]
+        if self._proc is not None:
+            with contextlib.suppress(Exception):
+                self._proc.kill()
+            self._proc = None
+        self._queue = None
 
     async def _pump_loop(self) -> None:
         decoder = HikStreamDecoder(self._channel)
@@ -332,36 +377,44 @@ class _Cpd7Stream:
                 if not h:
                     continue
                 rap = self._scan(h)
-                if self._queue.full():
-                    self._resync(self._queue)
+                queue = self._queue
+                if queue is None:
+                    continue  # no MJPEG encoder running
+                if self._await_rap:
+                    if not rap:
+                        continue
+                    self._await_rap = False
+                if queue.full():
+                    self._resync(queue)
                 with contextlib.suppress(asyncio.QueueFull):
-                    self._queue.put_nowait((rap, h))
+                    queue.put_nowait((rap, h))
         except asyncio.CancelledError:
             raise
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("CPD7 pump %s ended: %s", self._serial, err)
         finally:
-            with contextlib.suppress(asyncio.QueueFull):
-                self._queue.put_nowait(None)
+            if self._queue is not None:
+                with contextlib.suppress(asyncio.QueueFull):
+                    self._queue.put_nowait(None)
 
-    async def _feed_loop(self) -> None:
+    async def _feed_loop(self, proc: asyncio.subprocess.Process, queue: asyncio.Queue) -> None:
         try:
             while True:
-                item = await self._queue.get()
+                item = await queue.get()
                 if item is None:
                     break
-                self._proc.stdin.write(item[1])
-                await self._proc.stdin.drain()
+                proc.stdin.write(item[1])
+                await proc.stdin.drain()
         except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
             pass
         finally:
             with contextlib.suppress(Exception):
-                self._proc.stdin.close()
+                proc.stdin.close()
 
-    async def _read_loop(self) -> None:
+    async def _read_loop(self, proc: asyncio.subprocess.Process) -> None:
         buf = bytearray()
         while True:
-            chunk = await self._proc.stdout.read(64 * 1024)
+            chunk = await proc.stdout.read(64 * 1024)
             if not chunk:
                 return
             buf.extend(chunk)
@@ -381,6 +434,7 @@ class _Cpd7Stream:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         self._tasks = []
+        self._encoder_tasks = []
         if self._proc is not None:
             with contextlib.suppress(Exception):
                 self._proc.kill()
@@ -616,6 +670,20 @@ class NikoCamera(NikoAccessEntity, Camera):
                 # Whatever happens above, give the upstream back.
                 await self._source.unsubscribe(feed)
         return response
+
+
+async def _start_mjpeg_ffmpeg(hass: HomeAssistant) -> asyncio.subprocess.Process:
+    """ffmpeg reading Annex-B H.264 on stdin and writing JPEG frames."""
+    return await asyncio.create_subprocess_exec(
+        get_ffmpeg_manager(hass).binary, "-loglevel", "error",
+        "-fflags", "+discardcorrupt", "-f", "h264", "-i", "pipe:0",
+        "-an", "-c:v", "mjpeg", "-q:v", str(MJPEG_QUALITY), "-r", str(MJPEG_FPS),
+        "-vf", f"scale={MJPEG_WIDTH}:{MJPEG_HEIGHT}",
+        "-f", "image2pipe", "pipe:1",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
 
 
 async def _start_native_ffmpeg(hass: HomeAssistant) -> asyncio.subprocess.Process | None:

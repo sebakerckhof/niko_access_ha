@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 
+import pytest
 from aiohttp import web
 from homeassistant.components.camera import CameraEntityFeature, async_get_stream_source
 
@@ -172,3 +174,118 @@ async def test_slow_consumer_loses_its_backlog(hass):
     assert items[0] is niko_camera._FEED_RESET
     assert [media for _, media in items[1:]] == [[3], [4]]
 
+
+class FakeLan:
+    """A station that sends a keyframe and an audio packet on every read."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self._frame = 0
+
+    def read_chunk(self) -> bytes:
+        time.sleep(0.005)
+        if self.closed:
+            return b""
+        self._frame += 1
+        return keyframe(self._frame * 3600) + cpd7(0, self._frame * 320, ULAW, marker=True)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+# Stands in for the MJPEG encoder: one (empty) JPEG for everything it reads.
+FAKE_ENCODER = """
+import sys
+while sys.stdin.buffer.read1(65536):
+    sys.stdout.buffer.write(bytes([0xFF, 0xD8, 0xFF, 0xD9]))
+    sys.stdout.buffer.flush()
+"""
+
+
+async def until(condition, timeout=5.0):  # noqa: ASYNC109
+    async with asyncio.timeout(timeout):
+        while not condition():  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+
+
+@pytest.fixture
+def station(monkeypatch):
+    """Fake station and MJPEG encoder; returns the lists of those that were started."""
+    lans: list[FakeLan] = []
+    encoders: list[asyncio.subprocess.Process] = []
+
+    async def open_lan(self):
+        lans.append(FakeLan())
+        return lans[-1]
+
+    async def start_encoder(hass):
+        encoders.append(
+            await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                FAKE_ENCODER,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+            )
+        )
+        return encoders[-1]
+
+    monkeypatch.setattr(niko_camera._Cpd7Stream, "_open_lan", open_lan)
+    monkeypatch.setattr(niko_camera, "_start_mjpeg_ffmpeg", start_encoder)
+    monkeypatch.setattr(niko_camera, "_LINGER_SEC", 0.05)
+    return lans, encoders
+
+
+async def test_mjpeg_encoder_runs_only_for_mjpeg_viewers(hass, station):
+    """A stream-source consumer does not pay for an MJPEG transcode nobody watches."""
+    lans, encoders = station
+    stream = niko_camera._Cpd7Stream(hass, None, "X12345678", "10.6.2.6", 1, "main")
+
+    feed = await stream.subscribe()
+    _, media = await asyncio.wait_for(feed.get(), 5)
+    assert [kind for kind, *_ in media] == ["v", "v", "v", "a"]
+    assert stream.audio_format == "mulaw"
+    assert encoders == []
+
+    # A snapshot or an MJPEG viewer starts the encoder on the running upstream...
+    assert await stream.acquire()
+    assert (len(lans), len(encoders)) == (1, 1)
+    assert await stream.frame_after(0, 5) is not None
+    await stream.release()
+    # ... and it stops again when they left, while the stream source carries on.
+    await until(lambda: stream._proc is None)
+    assert stream.alive
+    while not feed.empty():
+        feed.get_nowait()
+    assert await asyncio.wait_for(feed.get(), 5) is not niko_camera._FEED_RESET
+
+    # A second MJPEG viewer gets a new encoder on the same upstream.
+    assert await stream.acquire()
+    assert (len(lans), len(encoders)) == (1, 2)
+    assert await stream.frame_after(0, 5) is not None
+    await stream.release()
+
+    await stream.unsubscribe(feed)
+    await until(lambda: lans[0].closed)
+    assert not stream.alive
+    assert stream._proc is None
+    for encoder in encoders:
+        await encoder.wait()
+
+
+async def test_mjpeg_only_viewer_opens_and_closes_everything(hass, station):
+    """Without a stream-source consumer the upstream follows the MJPEG viewers, as before."""
+    lans, encoders = station
+    stream = niko_camera._Cpd7Stream(hass, None, "X12345678", "10.6.2.6", 1, "main")
+
+    assert await stream.acquire()
+    assert await stream.frame_after(0, 5) is not None
+    # A second viewer inside the linger window reuses both.
+    await stream.release()
+    assert await stream.acquire()
+    assert (len(lans), len(encoders)) == (1, 1)
+    await stream.release()
+    await until(lambda: lans[0].closed)
+    assert not stream.alive
+    assert stream._proc is None
+    await encoders[0].wait()

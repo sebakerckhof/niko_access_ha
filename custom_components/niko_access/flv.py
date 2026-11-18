@@ -36,7 +36,8 @@ class FlvMuxer:
     """Turns ``HikStreamDecoder.take_media()`` packets into an FLV byte stream.
 
     Output starts with the first keyframe that has its SPS/PPS; audio before that
-    is dropped. ``audio_format`` None writes a video-only FLV.
+    is dropped. ``audio_format`` None writes a video-only FLV. After ``resync()``
+    the video continues at the next keyframe.
     """
 
     def __init__(self, audio_format: str | None) -> None:
@@ -50,6 +51,7 @@ class FlvMuxer:
         self._sps = b""
         self._pps = b""
         self._config = b""
+        self._resync = False
 
     def video(self, ts: int, marker: bool, data: bytes, now: float) -> bytes:
         """One RTP packet's Annex-B bytes; returns FLV bytes for completed frames."""
@@ -70,6 +72,12 @@ class FlvMuxer:
         ms = self._ms(_TAG_AUDIO, ts, _AUDIO_RATE, now)
         return _tag(_TAG_AUDIO, ms, bytes([self._audio_header]) + data)
 
+    def resync(self) -> None:
+        """Packets were lost: drop the frame in progress, resume at the next keyframe."""
+        self._unit.clear()
+        self._unit_ts = None
+        self._resync = True
+
     def _flush(self) -> bytes:
         nals = [nal for nal in bytes(self._unit).split(_SC) if nal]
         ts, now = self._unit_ts, self._unit_at
@@ -84,6 +92,10 @@ class FlvMuxer:
                 self._pps = nal
             elif nal_type == 5:
                 keyframe = True
+        if self._resync:
+            if not keyframe:
+                return b""
+            self._resync = False
         out = b""
         if self._start is None:
             if not (keyframe and self._sps and self._pps):

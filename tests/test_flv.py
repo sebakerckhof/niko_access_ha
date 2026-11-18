@@ -60,3 +60,18 @@ def test_without_audio():
     out = m.video(0, True, SC + SPS + SC + PPS + SC + IDR, 1.0)
     assert out[:5] == b"FLV\x01\x01"
     assert m.audio(0, ULAW, 1.0) == b""
+
+
+def test_resync_continues_at_the_next_keyframe():
+    m = FlvMuxer("mulaw")
+    m.video(0, True, SC + SPS + SC + PPS + SC + IDR, 1.0)
+    m.video(3600, False, SC + SLICE, 1.04)  # a frame in progress when packets were lost
+    m.resync()
+    assert m.video(7200, True, SC + SLICE, 1.08) == b""
+    assert m.video(10800, True, SC + SLICE, 1.12) == b""
+    # Audio does not depend on earlier packets, so it carries on.
+    assert m.audio(960, ULAW, 1.12) != b""
+    out = m.video(14400, True, SC + SPS + SC + PPS + SC + IDR, 1.16)
+    ((kind, ms, frame),) = flv_tags(b"FLV\x01\x05" + bytes(8) + out)
+    assert (kind, ms, frame[:2]) == (9, 160, b"\x17\x01")
+    assert m.video(18000, True, SC + SLICE, 1.2) != b""

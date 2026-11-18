@@ -69,6 +69,8 @@ _NATIVE_WAIT_SEC = 1.0
 # How long a new stream waits to learn whether the station sends audio.
 _AUDIO_PROBE_SEC = 1.0
 _NATIVE_STREAMS = f"{DOMAIN}_native_streams"
+# Queued for a stream-source consumer whose backlog was dropped.
+_FEED_RESET = object()
 
 
 async def async_setup_entry(
@@ -158,7 +160,11 @@ class _Cpd7Stream:
             )
 
     async def subscribe(self) -> asyncio.Queue | None:
-        """Open (or join) the upstream and receive its decoded media packets."""
+        """Open (or join) the upstream and receive its decoded media packets.
+
+        A consumer that falls a full queue behind loses its backlog and gets
+        ``_FEED_RESET``: it has to continue at the next keyframe.
+        """
         if not await self.acquire():
             return None
         feed: asyncio.Queue = asyncio.Queue(maxsize=_NATIVE_QUEUE_MAX)
@@ -168,6 +174,15 @@ class _Cpd7Stream:
     async def unsubscribe(self, feed: asyncio.Queue) -> None:
         self._feeds.discard(feed)
         await self.release()
+
+    def _publish_media(self, media: list) -> None:
+        item = (asyncio.get_running_loop().time(), media)
+        for feed in self._feeds:
+            if feed.full():
+                while not feed.empty():
+                    feed.get_nowait()
+                feed.put_nowait(_FEED_RESET)
+            feed.put_nowait(item)
 
     @property
     def audio_format(self) -> str | None:
@@ -312,10 +327,7 @@ class _Cpd7Stream:
                 if decoder.audio_format:
                     self._audio_format = decoder.audio_format
                 if media and self._feeds:
-                    item = (asyncio.get_running_loop().time(), media)
-                    for feed in self._feeds:
-                        with contextlib.suppress(asyncio.QueueFull):
-                            feed.put_nowait(item)
+                    self._publish_media(media)
                 h = decoder.take()
                 if not h:
                     continue
@@ -559,6 +571,12 @@ class NikoCamera(NikoAccessEntity, Camera):
                         next_revive = now + _FIRST_FRAME_TIMEOUT
                     continue
                 last_fresh = now
+                if item is _FEED_RESET:
+                    # Too far behind: the backlog is gone, continue at a keyframe.
+                    pending.clear()
+                    if muxer is not None:
+                        muxer.resync()
+                    continue
                 pending.append(item)
                 if muxer is None:
                     # Packets carry their own timing, so they can wait until it is
@@ -585,15 +603,18 @@ class NikoCamera(NikoAccessEntity, Camera):
         ):
             pass
         finally:
-            if copy is not None:
-                copy.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await copy
-            if proc is not None:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                await proc.wait()
-            await self._source.unsubscribe(feed)
+            try:
+                if copy is not None:
+                    copy.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await copy
+                if proc is not None:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
+                    await proc.wait()
+            finally:
+                # Whatever happens above, give the upstream back.
+                await self._source.unsubscribe(feed)
         return response
 
 

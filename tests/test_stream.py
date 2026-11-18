@@ -10,8 +10,9 @@ from homeassistant.components.camera import CameraEntityFeature, async_get_strea
 
 from custom_components.niko_access import camera as niko_camera
 from custom_components.niko_access.cpd7.hik_decoder import HikStreamDecoder
+from custom_components.niko_access.flv import FlvMuxer
 
-from .test_hik_decoder import IDR, PPS, SPS, ULAW, cpd7
+from .test_hik_decoder import IDR, PPS, SLICE, SPS, ULAW, cpd7
 from .test_integration import entry_for
 
 CAMERA = "camera.external_unit_live_video"
@@ -106,3 +107,68 @@ async def test_stream_muxes_video_and_audio(hass, cloud, hass_client, monkeypatc
     assert SPS in body and IDR in body
     assert b"\x82" + ULAW[:20] in body
     assert released == [feed]
+
+
+def keyframe(ts: int) -> bytes:
+    return cpd7(96, ts, SPS) + cpd7(96, ts, PPS) + cpd7(96, ts, IDR, marker=True)
+
+
+async def test_stream_continues_at_a_keyframe_after_losing_its_backlog(
+    hass, cloud, hass_client, monkeypatch
+):
+    """After _FEED_RESET the handler drops frames up to the next keyframe."""
+    decoder = HikStreamDecoder(1)
+    items = []
+    for data in (keyframe(9000), cpd7(96, 12600, SLICE, marker=True), keyframe(16200)):
+        decoder.feed(data)
+        items.append((100.0 + len(items) * 0.04, decoder.take_media()))
+    feed: asyncio.Queue = asyncio.Queue()
+    for item in (items[0], niko_camera._FEED_RESET, items[1], items[2]):
+        feed.put_nowait(item)
+
+    reference = FlvMuxer("mulaw")
+    expected = b""
+    for index, (at, media) in enumerate(items):
+        if index == 1:
+            reference.resync()
+        expected += b"".join(reference.video(ts, marker, data, at) for _, ts, marker, data in media)
+
+    async def subscribe(self):
+        self._audio_format = "mulaw"
+        return feed
+
+    async def unsubscribe(self, queue):
+        pass
+
+    async def fake_ffmpeg(hass):
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            f"import sys; sys.stdout.buffer.write(sys.stdin.buffer.read({len(expected)}))",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+        )
+
+    monkeypatch.setattr(niko_camera._Cpd7Stream, "subscribe", subscribe)
+    monkeypatch.setattr(niko_camera._Cpd7Stream, "unsubscribe", unsubscribe)
+    monkeypatch.setattr(niko_camera, "_start_native_ffmpeg", fake_ffmpeg)
+    await setup_camera(hass, camera_stream=True)
+    client = await hass_client()
+
+    body = await (await client.get(f"/api/niko_access/stream/{CAMERA}")).read()
+    assert body == expected
+    assert body.count(IDR) == 2
+    assert SLICE not in body
+
+
+async def test_slow_consumer_loses_its_backlog(hass):
+    stream = niko_camera._Cpd7Stream(hass, None, "X12345678", "10.6.2.6", 1, "main")
+    feed: asyncio.Queue = asyncio.Queue(maxsize=3)
+    stream._feeds.add(feed)
+    for packet in range(5):
+        stream._publish_media([packet])
+    items = [feed.get_nowait() for _ in range(feed.qsize())]
+    # 0-2 filled the queue; they were dropped when 3 arrived.
+    assert items[0] is niko_camera._FEED_RESET
+    assert [media for _, media in items[1:]] == [[3], [4]]
+

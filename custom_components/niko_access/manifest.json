@@ -16,6 +16,7 @@
     "custom_components.niko_access"
   ],
   "requirements": [
+    "pycryptodome",
     "xmltodict"
   ],
   "version": "0.1.4"

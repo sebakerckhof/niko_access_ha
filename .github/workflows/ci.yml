@@ -15,8 +15,13 @@ jobs:
       - name: Create venv and install deps
         run: |
           uv venv
-          uv pip install ruff pytest-homeassistant-custom-component \
-            pycryptodome cryptography xmltodict ha-ffmpeg PyTurboJPEG
+          # Test tooling, plus what Home Assistant's own ffmpeg and camera
+          # components need.
+          uv pip install ruff pytest-homeassistant-custom-component ha-ffmpeg PyTurboJPEG
+          # The integration's requirements come from its manifest, as Home
+          # Assistant installs them: a package missing there fails the tests.
+          jq -r '.requirements[]' custom_components/niko_access/manifest.json \
+            | uv pip install -r -
       - name: Ruff
         run: uv run ruff check custom_components tests
       - name: Pytest

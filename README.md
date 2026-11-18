@@ -87,8 +87,12 @@ A local dev Home Assistant is provided: `docker compose up -d` → http://localh
 
 - Local video (CPD7) builds on the excellent, MIT-licensed
   **[rtammekivi/hikconnect_intercom](https://github.com/rtammekivi/hikconnect_intercom)**
-  (vendored under `custom_components/niko_access/cpd7/`). See
-  [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
+  (vendored under `custom_components/niko_access/cpd7/`).
+- Its CAS client comes from the Apache-2.0-licensed
+  **[RenierM26/pyEzvizApi](https://github.com/RenierM26/pyEzvizApi)**.
+
+See [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for the copyright
+notices and full licence texts.
 
 ## Legal & trademarks
 
@@ -110,7 +114,5 @@ respective owners and are **not** licensed under this project's licence.
 
 GNU Affero General Public License v3.0 (AGPL-3.0) — see [`LICENSE`](LICENSE). This
 covers this project's own code. Third-party code keeps its own licence (the
-vendored CPD7 library is MIT — see credits), and the referenced trademarks/logos
-remain the property of their owners.
-EOF
-echo "README written ($(wc -l < README.md) lines)"
+vendored CPD7 library is MIT, its CAS client Apache-2.0 — see credits), and the
+referenced trademarks/logos remain the property of their owners.

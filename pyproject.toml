@@ -9,7 +9,8 @@ license = { text = "AGPL-3.0-or-later" }
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-# Vendored third-party CPD7 library (MIT, rtammekivi/hikconnect_intercom) — not linted.
+# Vendored third-party CPD7 library (MIT rtammekivi/hikconnect_intercom; cas.py and
+# _const.py Apache-2.0 pyezvizapi) — not linted. See THIRD_PARTY_LICENSES.md.
 extend-exclude = [
   "custom_components/niko_access/cpd7/cas.py",
   "custom_components/niko_access/cpd7/crypto.py",

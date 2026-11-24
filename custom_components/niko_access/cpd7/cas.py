@@ -1,4 +1,20 @@
-"""pyezvizapi CAS API Functions."""
+"""pyezvizapi CAS API Functions.
+
+Derived from pyezvizapi (https://github.com/RenierM26/pyEzvizApi),
+Copyright Renier Moorcroft, licensed under the Apache License, Version 2.0, and
+vendored here by way of rtammekivi/hikconnect_intercom. The license text is in
+LICENSE.pyezvizapi.txt next to this file; see also THIRD_PARTY_LICENSES.md.
+
+This file was modified from the pyezvizapi original:
+
+- constants and exceptions come from the local ``_const`` module, and the
+  feature code is no longer resolved through pyezvizapi's cloud helpers;
+- TLS trusts the CAs in ``cas_ca_bundle.pem`` in addition to the system store;
+- an expired CAS certificate is only accepted after its chain, signatures and
+  name are verified against ``cas_ca_bundle.pem`` (the original checked the
+  expiry date and the name only);
+- debug logging no longer includes CAS response bodies, which hold device keys.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +34,7 @@ from xml.parsers.expat import ExpatError
 
 from Crypto.Cipher import AES
 from cryptography import x509
+from cryptography.x509.verification import PolicyBuilder, Store, VerificationError
 import xmltodict
 
 from ._const import FEATURE_CODE, XOR_KEY
@@ -121,7 +138,9 @@ def _cas_tls_context(*, verify_certificate: bool = True) -> ssl.SSLContext:
     if not verify_certificate:
         # EZVIZ app clients tolerate expired CAS WebPKI certificates. Python's
         # SSL layer cannot ignore only expiry, so this context is used only after
-        # a normal verified handshake has failed specifically for expiry.
+        # a normal verified handshake has failed specifically for expiry. It
+        # verifies nothing itself: the caller must pass the peer's chain to
+        # _verify_expired_cas_certificate_chain before sending anything.
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
     return context
@@ -136,67 +155,63 @@ def _is_certificate_expired_error(err: ssl.SSLCertVerificationError) -> bool:
     return "certificate has expired" in verify_message.lower()
 
 
-def _certificate_not_valid_after(cert: x509.Certificate) -> dt.datetime:
-    """Return the certificate notAfter timestamp as timezone-aware UTC."""
-    not_valid_after_utc = getattr(cert, "not_valid_after_utc", None)
-    if isinstance(not_valid_after_utc, dt.datetime):
-        return not_valid_after_utc
-    return cert.not_valid_after.replace(tzinfo=dt.UTC)
-
-
 def _normalize_dns_name(host: str) -> str:
     """Return an ASCII DNS name suitable for certificate matching."""
     return host.rstrip(".").encode("idna").decode("ascii").lower()
 
 
-def _dns_name_matches(pattern: str, host: str) -> bool:
-    """Return True when a certificate DNS SAN matches a host."""
-    pattern = _normalize_dns_name(pattern)
-    host = _normalize_dns_name(host)
-    if "*" not in pattern:
-        return pattern == host
-    if pattern.count("*") != 1 or not pattern.startswith("*."):
-        return False
-    suffix = pattern[1:]
-    return host.endswith(suffix) and host.count(".") == pattern.count(".")
+def _peer_certificate_chain(sock: ssl.SSLSocket) -> list[bytes]:
+    """Return the DER certificates the peer presented, leaf first."""
+    get_chain = getattr(sock, "get_unverified_chain", None)  # Python 3.13+
+    chain = get_chain() if callable(get_chain) else None
+    if not chain:
+        leaf = sock.getpeercert(binary_form=True)
+        chain = [leaf] if leaf else []
+    return [bytes(cert) for cert in chain]
 
 
-def _certificate_matches_host(cert: x509.Certificate, host: str) -> bool:
-    """Return True when the certificate SAN matches the requested host."""
-    san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-    try:
-        host_ip = ipaddress.ip_address(host)
-    except ValueError:
-        host_ip = None
-    if host_ip is not None:
-        return any(
-            ip_address == host_ip for ip_address in san.get_values_for_type(x509.IPAddress)
-        )
-    return any(
-        _dns_name_matches(dns_name, host)
-        for dns_name in san.get_values_for_type(x509.DNSName)
-    )
+def _verify_expired_cas_certificate_chain(
+    chain_der: list[bytes], *, host: str
+) -> None:
+    """Verify an expired CAS peer chain as of the last second it was valid.
 
-
-def _verify_expired_cas_certificate_hostname(sock: ssl.SSLSocket, *, host: str) -> None:
-    """Verify the expired CAS peer certificate is issued for the requested host."""
-    cert_der = sock.getpeercert(binary_form=True)
-    if not cert_der:
+    The handshake that produced ``chain_der`` verified nothing, so this does
+    what a verified handshake does: it builds the chain up to a CA in
+    ``cas_ca_bundle.pem``, checks every signature, and checks that the leaf is
+    a server certificate for ``host``. Only the clock differs: it is set to
+    just before the leaf expired, so nothing but the expiry is tolerated.
+    """
+    if not chain_der:
         raise PyEzvizError("CAS TLS peer did not present a certificate")
 
     try:
-        cert = x509.load_der_x509_certificate(cert_der)
-        if _certificate_not_valid_after(cert) >= dt.datetime.now(dt.UTC):
+        leaf, *intermediates = (
+            x509.load_der_x509_certificate(cert_der) for cert_der in chain_der
+        )
+        not_valid_after = leaf.not_valid_after_utc
+        if not_valid_after >= dt.datetime.now(dt.UTC):
             raise PyEzvizError(
                 "CAS TLS expiry fallback received a non-expired certificate"
             )
-        if not _certificate_matches_host(cert, host):
-            raise ssl.CertificateError("CAS TLS certificate hostname mismatch")
+        try:
+            subject: x509.DNSName | x509.IPAddress = x509.IPAddress(
+                ipaddress.ip_address(host)
+            )
+        except ValueError:
+            subject = x509.DNSName(_normalize_dns_name(host))
+        trusted = Store(x509.load_pem_x509_certificates(CAS_CA_BUNDLE.read_bytes()))
+        verifier = (
+            PolicyBuilder()
+            .store(trusted)
+            .time(not_valid_after - dt.timedelta(seconds=1))
+            .build_server_verifier(subject)
+        )
+        verifier.verify(leaf, intermediates)
     except PyEzvizError:
         raise
-    except (UnicodeError, ssl.CertificateError, ValueError, x509.ExtensionNotFound) as err:
+    except (VerificationError, UnicodeError, ValueError) as err:
         raise PyEzvizError(
-            f"CAS TLS certificate is not valid for {host}"
+            f"CAS TLS certificate is not valid for {host}: {err}"
         ) from err
 
 
@@ -415,12 +430,17 @@ class EzvizCAS:
         token: dict[str, Any] | None,
         *,
         client_type: int = CAS_ANDROID_CLIENT_TYPE,
-        verify_tls_certificate: bool = False,
+        allow_expired_certificate: bool = True,
     ) -> None:
-        """Initialize the client object."""
+        """Initialize the client object.
+
+        The CAS certificate is always verified. ``allow_expired_certificate``
+        only decides whether a certificate that is valid in every other
+        respect may be past its expiry date, as the vendor's apps allow.
+        """
         self._session = None
         self._client_type = client_type
-        self._verify_tls_certificate = verify_tls_certificate
+        self._allow_expired_certificate = allow_expired_certificate
         self._token: dict[str, Any] = token or {
             "session_id": None,
             "rf_session_id": None,
@@ -472,8 +492,9 @@ class EzvizCAS:
                         server_hostname=host,
                     )
                 except ssl.SSLCertVerificationError as err:
-                    if self._verify_tls_certificate or not _is_certificate_expired_error(
-                        err
+                    if (
+                        not self._allow_expired_certificate
+                        or not _is_certificate_expired_error(err)
                     ):
                         raise
                     sock.close()
@@ -484,7 +505,9 @@ class EzvizCAS:
                         sock,
                         server_hostname=host,
                     )
-                    _verify_expired_cas_certificate_hostname(sock, host=host)
+                    _verify_expired_cas_certificate_chain(
+                        _peer_certificate_chain(sock), host=host
+                    )
                 if hasattr(sock, "settimeout"):
                     sock.settimeout(CAS_SOCKET_TIMEOUT)
 
@@ -526,7 +549,8 @@ class EzvizCAS:
             use_tls=True,
         )
         response_bytes = result.response
-        _LOGGER.debug("Get Encryption Key: %r", response_bytes)
+        # The response holds the device's control key: never log its content.
+        _LOGGER.debug("CAS get-encryption response: %d bytes", len(response_bytes))
 
         # Trim the framed header/tail and convert XML to dict.
         body = _cas_response_body(response_bytes, context="get-encryption")
@@ -575,6 +599,6 @@ class EzvizCAS:
             port=port,
             use_tls=True,
         )
-        _LOGGER.debug("Set camera response: %r", result.response)
+        _LOGGER.debug("CAS set-defence response: %d bytes", len(result.response))
 
         return True

@@ -4,6 +4,10 @@ The cloud only brokers a per-device control key (via CAS); the H.264 video is
 pulled directly from the station on ports 9010/9020, de-framed in pure Python
 (vendored `cpd7/`), and transcoded to MJPEG by ffmpeg for Home Assistant.
 
+With the "stream with audio" option, the camera also offers a stream source: the
+station's own H.264, copied, with its G.711 audio encoded to AAC, as MPEG-TS. Home
+Assistant then plays it over WebRTC/HLS with sound.
+
 The CPD7 pipeline (shared ffmpeg encoder, keyframe-aware feed) is adapted from
 rtammekivi/hikconnect_intercom (MIT); see THIRD_PARTY_LICENSES.md. It is enabled
 only when a camera IP is set in the integration options, since the cloud does
@@ -15,10 +19,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
 
 from aiohttp import web
-from homeassistant.components.camera import Camera
+from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.components.ffmpeg import get_ffmpeg_manager
+from homeassistant.components.http import KEY_AUTHENTICATED, HomeAssistantView
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
@@ -26,8 +32,11 @@ from .const import (
     CONF_CAMERA_CHANNEL,
     CONF_CAMERA_IP,
     CONF_CAMERA_QUALITY,
+    CONF_CAMERA_STREAM,
     DEFAULT_CAMERA_CHANNEL,
     DEFAULT_CAMERA_QUALITY,
+    DEFAULT_CAMERA_STREAM,
+    DOMAIN,
     MJPEG_FPS,
     MJPEG_HEIGHT,
     MJPEG_QUALITY,
@@ -38,6 +47,7 @@ from .cpd7.hik_decoder import HikStreamDecoder
 from .cpd7.lan_client import ControlKeyError, Cpd7LanClient
 from .discovery import async_find_ip
 from .entity import NikoAccessEntity
+from .flv import FlvMuxer
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,6 +63,14 @@ _MAX_EMPTY_READS = 40
 _KEEPALIVE_SEC = 0.25
 _MAX_STALL_SEC = 90.0
 _MJPEG_BOUNDARY = "frame"
+# Stream source (H.264 + audio as MPEG-TS).
+_NATIVE_QUEUE_MAX = 1000
+_NATIVE_WAIT_SEC = 1.0
+# How long a new stream waits to learn whether the station sends audio.
+_AUDIO_PROBE_SEC = 1.0
+_NATIVE_STREAMS = f"{DOMAIN}_native_streams"
+# Queued for a stream-source consumer whose backlog was dropped.
+_FEED_RESET = object()
 
 
 async def async_setup_entry(
@@ -66,16 +84,24 @@ async def async_setup_entry(
     coordinator = entry.runtime_data
     channel = int(entry.options.get(CONF_CAMERA_CHANNEL, DEFAULT_CAMERA_CHANNEL))
     quality = entry.options.get(CONF_CAMERA_QUALITY, DEFAULT_CAMERA_QUALITY)
+    native = entry.options.get(CONF_CAMERA_STREAM, DEFAULT_CAMERA_STREAM)
+    if native and _NATIVE_STREAMS not in hass.data:
+        hass.data[_NATIVE_STREAMS] = {}
+        hass.http.register_view(_NativeStreamView(hass.data[_NATIVE_STREAMS]))
     # One camera per device that answered the call endpoint (the door station).
     serials = [s for s, st in coordinator.data.items() if st.call is not None]
     serials = serials or list(coordinator.data)
     async_add_entities(
-        NikoCamera(coordinator, serial, ip, channel, quality) for serial in serials
+        NikoCamera(coordinator, serial, ip, channel, quality, native) for serial in serials
     )
 
 
 class _Cpd7Stream:
-    """One CPD7 upstream + one ffmpeg encoder, shared by all viewers.
+    """One CPD7 upstream + one ffmpeg MJPEG encoder, shared by all viewers.
+
+    The encoder runs only while someone watches MJPEG or takes a snapshot.
+    Stream-source consumers get the station's packets as they are, so they do
+    not need it.
 
     Adapted from hikconnect_intercom's _ChannelStream, decoupled from its
     coordinators: the station IP and the CAS key come from this integration.
@@ -101,8 +127,13 @@ class _Cpd7Stream:
         self._proc: asyncio.subprocess.Process | None = None
         self._queue: asyncio.Queue | None = None
         self._tasks: list[asyncio.Task] = []
+        self._encoder_tasks: list[asyncio.Task] = []
         self._stopping = False
         self._users = 0
+        # Users that need the MJPEG encoder (viewers and snapshots).
+        self._mjpeg_users = 0
+        # The encoder joined a running upstream: feed it from the next keyframe.
+        self._await_rap = False
         self._jpeg: bytes | None = None
         self._seq = 0
         self._waiters: set[asyncio.Event] = set()
@@ -111,32 +142,86 @@ class _Cpd7Stream:
         self._lock = asyncio.Lock()
         self._linger = None
         self._reviving: asyncio.Task | None = None
+        # Stream-source consumers: queues of (arrival time, take_media() list).
+        self._feeds: set[asyncio.Queue] = set()
+        self._audio_format: str | None = None
 
-    async def acquire(self) -> bool:
+    async def acquire(self, *, mjpeg: bool = True) -> bool:
+        """Open (or join) the upstream; with ``mjpeg`` also its MJPEG encoder."""
         async with self._lock:
             if self._linger is not None:
                 self._linger.cancel()
                 self._linger = None
-            if self._proc is not None and any(t.done() for t in self._tasks):
+            if self._lan is not None and any(t.done() for t in self._tasks):
                 await self._teardown()
-            if self._proc is None and not await self._open():
-                return False
-            self._users += 1
-            return True
+            if mjpeg:
+                self._mjpeg_users += 1
+            if self._lan is None:
+                opened = await self._open()
+            else:
+                opened = (
+                    not mjpeg
+                    or self._proc is not None
+                    or await self._start_encoder(midstream=True)
+                )
+            if opened:
+                self._users += 1
+            elif mjpeg:
+                self._mjpeg_users -= 1
+            self._schedule_linger()
+            return opened
 
-    async def release(self) -> None:
+    async def release(self, *, mjpeg: bool = True) -> None:
         async with self._lock:
             self._users = max(0, self._users - 1)
-            if self._users or self._proc is None:
-                return
-            loop = asyncio.get_running_loop()
-            self._linger = loop.call_later(
+            if mjpeg:
+                self._mjpeg_users = max(0, self._mjpeg_users - 1)
+            self._schedule_linger()
+
+    def _schedule_linger(self) -> None:
+        """(Re)arm the timer that closes what nobody uses any more."""
+        if self._linger is not None:
+            self._linger.cancel()
+            self._linger = None
+        idle_encoder = self._proc is not None and not self._mjpeg_users
+        if self._lan is not None and (not self._users or idle_encoder):
+            self._linger = asyncio.get_running_loop().call_later(
                 _LINGER_SEC, lambda: asyncio.create_task(self._linger_teardown())
             )
 
+    async def subscribe(self) -> asyncio.Queue | None:
+        """Open (or join) the upstream and receive its decoded media packets.
+
+        A consumer that falls a full queue behind loses its backlog and gets
+        ``_FEED_RESET``: it has to continue at the next keyframe.
+        """
+        if not await self.acquire(mjpeg=False):
+            return None
+        feed: asyncio.Queue = asyncio.Queue(maxsize=_NATIVE_QUEUE_MAX)
+        self._feeds.add(feed)
+        return feed
+
+    async def unsubscribe(self, feed: asyncio.Queue) -> None:
+        self._feeds.discard(feed)
+        await self.release(mjpeg=False)
+
+    def _publish_media(self, media: list) -> None:
+        item = (asyncio.get_running_loop().time(), media)
+        for feed in self._feeds:
+            if feed.full():
+                while not feed.empty():
+                    feed.get_nowait()
+                feed.put_nowait(_FEED_RESET)
+            feed.put_nowait(item)
+
+    @property
+    def audio_format(self) -> str | None:
+        """G.711 variant ("mulaw"/"alaw") once the station sent audio."""
+        return self._audio_format
+
     @property
     def alive(self) -> bool:
-        return self._proc is not None and not any(t.done() for t in self._tasks)
+        return self._lan is not None and not any(t.done() for t in self._tasks)
 
     def revive(self) -> None:
         """Reopen the upstream in the background, keeping the current viewers."""
@@ -156,6 +241,8 @@ class _Cpd7Stream:
             self._linger = None
             if not self._users:
                 await self._teardown()
+            elif not self._mjpeg_users:
+                await self._stop_encoder()
 
     @property
     def latest(self) -> tuple[int, bytes] | None:
@@ -225,35 +312,48 @@ class _Cpd7Stream:
         lan = await self._open_lan()
         if lan is None:
             return False
+        self._lan = lan
+        self._stopping = False
+        if self._mjpeg_users and not await self._start_encoder():
+            await self._teardown()
+            return False
+        self._tasks.append(asyncio.create_task(self._pump_loop()))
+        return True
+
+    async def _start_encoder(self, *, midstream: bool = False) -> bool:
+        """Start the MJPEG encoder; ``midstream`` when the upstream already runs."""
         try:
-            proc = await asyncio.create_subprocess_exec(
-                get_ffmpeg_manager(self._hass).binary, "-loglevel", "error",
-                "-fflags", "+discardcorrupt", "-f", "h264", "-i", "pipe:0",
-                "-an", "-c:v", "mjpeg", "-q:v", str(MJPEG_QUALITY), "-r", str(MJPEG_FPS),
-                "-vf", f"scale={MJPEG_WIDTH}:{MJPEG_HEIGHT}",
-                "-f", "image2pipe", "pipe:1",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
+            proc = await _start_mjpeg_ffmpeg(self._hass)
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("ffmpeg failed to start for %s: %s", self._serial, err)
-            with contextlib.suppress(Exception):
-                await self._hass.async_add_executor_job(lan.close)
             return False
-        self._lan = lan
         self._proc = proc
-        self._stopping = False
         self._jpeg = None
-        self._queue = asyncio.Queue(maxsize=_FEED_QUEUE_MAX)
+        self._queue = queue = asyncio.Queue(maxsize=_FEED_QUEUE_MAX)
+        self._await_rap = midstream
         if self._sps and self._pps:
-            self._queue.put_nowait((False, self._sps + self._pps))
-        self._tasks = [
-            asyncio.create_task(self._pump_loop()),
-            asyncio.create_task(self._feed_loop()),
-            asyncio.create_task(self._read_loop()),
+            queue.put_nowait((False, self._sps + self._pps))
+        self._encoder_tasks = [
+            asyncio.create_task(self._feed_loop(proc, queue)),
+            asyncio.create_task(self._read_loop(proc)),
         ]
+        self._tasks += self._encoder_tasks
         return True
+
+    async def _stop_encoder(self) -> None:
+        """Stop the MJPEG encoder and leave the upstream to its other consumers."""
+        tasks, self._encoder_tasks = self._encoder_tasks, []
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._tasks = [task for task in self._tasks if task not in tasks]
+        if self._proc is not None:
+            with contextlib.suppress(Exception):
+                self._proc.kill()
+            self._proc = None
+        self._queue = None
 
     async def _pump_loop(self) -> None:
         decoder = HikStreamDecoder(self._channel)
@@ -268,40 +368,53 @@ class _Cpd7Stream:
                     continue
                 empty = 0
                 decoder.feed(buf)
+                media = decoder.take_media()
+                if decoder.audio_format:
+                    self._audio_format = decoder.audio_format
+                if media and self._feeds:
+                    self._publish_media(media)
                 h = decoder.take()
                 if not h:
                     continue
                 rap = self._scan(h)
-                if self._queue.full():
-                    self._resync(self._queue)
+                queue = self._queue
+                if queue is None:
+                    continue  # no MJPEG encoder running
+                if self._await_rap:
+                    if not rap:
+                        continue
+                    self._await_rap = False
+                if queue.full():
+                    self._resync(queue)
                 with contextlib.suppress(asyncio.QueueFull):
-                    self._queue.put_nowait((rap, h))
+                    queue.put_nowait((rap, h))
         except asyncio.CancelledError:
             raise
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("CPD7 pump %s ended: %s", self._serial, err)
         finally:
-            with contextlib.suppress(asyncio.QueueFull):
-                self._queue.put_nowait(None)
+            if self._queue is not None:
+                with contextlib.suppress(asyncio.QueueFull):
+                    self._queue.put_nowait(None)
 
-    async def _feed_loop(self) -> None:
+    async def _feed_loop(self, proc: asyncio.subprocess.Process, queue: asyncio.Queue) -> None:
         try:
             while True:
-                item = await self._queue.get()
+                item = await queue.get()
                 if item is None:
                     break
-                self._proc.stdin.write(item[1])
-                await self._proc.stdin.drain()
+                proc.stdin.write(item[1])
+                await proc.stdin.drain()
         except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
             pass
         finally:
             with contextlib.suppress(Exception):
-                self._proc.stdin.close()
+                proc.stdin.close()
 
-    async def _read_loop(self) -> None:
+    async def _read_loop(self, proc: asyncio.subprocess.Process) -> None:
         buf = bytearray()
         while True:
-            chunk = await self._proc.stdout.read(64 * 1024)
+            chunk = await proc.stdout.read(64 * 1024)
             if not chunk:
                 return
             buf.extend(chunk)
@@ -321,6 +434,7 @@ class _Cpd7Stream:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         self._tasks = []
+        self._encoder_tasks = []
         if self._proc is not None:
             with contextlib.suppress(Exception):
                 self._proc.kill()
@@ -383,6 +497,7 @@ class NikoCamera(NikoAccessEntity, Camera):
         ip: str,
         channel: int,
         quality: str,
+        native: bool = False,
     ) -> None:
         NikoAccessEntity.__init__(self, coordinator, serial, "camera")
         Camera.__init__(self)
@@ -390,6 +505,28 @@ class NikoCamera(NikoAccessEntity, Camera):
             coordinator.hass, coordinator, serial, ip, channel, quality
         )
         self._last: bytes | None = None
+        self._native = native
+        self._token = secrets.token_urlsafe(32)
+        if native:
+            self._attr_supported_features = CameraEntityFeature.STREAM
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self._native:
+            self.hass.data[_NATIVE_STREAMS][self._token] = self
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._native:
+            self.hass.data[_NATIVE_STREAMS].pop(self._token, None)
+        await super().async_will_remove_from_hass()
+
+    async def stream_source(self) -> str | None:
+        """The stream served by _NativeStreamView; its token is the credential."""
+        api = self.hass.config.api
+        if not self._native or api is None:
+            return None
+        scheme = "https" if api.use_ssl else "http"
+        return f"{scheme}://127.0.0.1:{api.port}/api/{DOMAIN}/stream/{self._token}"
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
@@ -451,3 +588,151 @@ class NikoCamera(NikoAccessEntity, Camera):
         finally:
             await self._source.release()
         return response
+
+    async def handle_native_stream(self, request: web.Request) -> web.StreamResponse:
+        """The station's H.264 (copied) and G.711 audio (encoded to AAC) as MPEG-TS."""
+        feed = await self._source.subscribe()
+        if feed is None:
+            return web.Response(status=503, text="no live feed")
+        response = web.StreamResponse(status=200, headers={"Content-Type": "video/mp2t"})
+        loop = asyncio.get_running_loop()
+        probe_until = loop.time() + _AUDIO_PROBE_SEC
+        last_fresh = loop.time()
+        next_revive = 0.0
+        pending: list = []
+        muxer: FlvMuxer | None = None
+        proc: asyncio.subprocess.Process | None = None
+        copy: asyncio.Task | None = None
+        try:
+            await response.prepare(request)
+            proc = await _start_native_ffmpeg(self.hass)
+            if proc is None:
+                return response
+            copy = asyncio.create_task(_copy_output(proc, response))
+            while not copy.done():
+                try:
+                    item = await asyncio.wait_for(feed.get(), _NATIVE_WAIT_SEC)
+                except TimeoutError:
+                    item = None
+                now = loop.time()
+                if item is None:
+                    if now - last_fresh >= _MAX_STALL_SEC:
+                        break
+                    # Stalled: reopen the upstream, as for MJPEG viewers.
+                    stalled = now - last_fresh >= _FRAME_TIMEOUT
+                    if now >= next_revive and (stalled or not self._source.alive):
+                        self._source.revive()
+                        next_revive = now + _FIRST_FRAME_TIMEOUT
+                    continue
+                last_fresh = now
+                if item is _FEED_RESET:
+                    # Too far behind: the backlog is gone, continue at a keyframe.
+                    pending.clear()
+                    if muxer is not None:
+                        muxer.resync()
+                    continue
+                pending.append(item)
+                if muxer is None:
+                    # Packets carry their own timing, so they can wait until it is
+                    # known whether the station sends audio.
+                    if self._source.audio_format is None and now < probe_until:
+                        continue
+                    muxer = FlvMuxer(self._source.audio_format)
+                data = b"".join(
+                    muxer.audio(ts, payload, at)
+                    if kind == "a"
+                    else muxer.video(ts, marker, payload, at)
+                    for at, media in pending
+                    for kind, ts, marker, payload in media
+                )
+                pending.clear()
+                if data:
+                    proc.stdin.write(data)
+                    await proc.stdin.drain()
+        except (
+            BrokenPipeError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            asyncio.CancelledError,
+        ):
+            pass
+        finally:
+            try:
+                if copy is not None:
+                    copy.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await copy
+                if proc is not None:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
+                    await proc.wait()
+            finally:
+                # Whatever happens above, give the upstream back.
+                await self._source.unsubscribe(feed)
+        return response
+
+
+async def _start_mjpeg_ffmpeg(hass: HomeAssistant) -> asyncio.subprocess.Process:
+    """ffmpeg reading Annex-B H.264 on stdin and writing JPEG frames."""
+    return await asyncio.create_subprocess_exec(
+        get_ffmpeg_manager(hass).binary, "-loglevel", "error",
+        "-fflags", "+discardcorrupt", "-f", "h264", "-i", "pipe:0",
+        "-an", "-c:v", "mjpeg", "-q:v", str(MJPEG_QUALITY), "-r", str(MJPEG_FPS),
+        "-vf", f"scale={MJPEG_WIDTH}:{MJPEG_HEIGHT}",
+        "-f", "image2pipe", "pipe:1",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+
+async def _start_native_ffmpeg(hass: HomeAssistant) -> asyncio.subprocess.Process | None:
+    """ffmpeg reading FLV on stdin and writing MPEG-TS (video copied, audio as AAC)."""
+    try:
+        return await asyncio.create_subprocess_exec(
+            get_ffmpeg_manager(hass).binary, "-loglevel", "error",
+            "-analyzeduration", "500000", "-f", "flv", "-i", "pipe:0",
+            "-map", "0:v", "-map", "0:a?", "-c:v", "copy",
+            "-c:a", "aac", "-ar", "16000", "-b:a", "32k",
+            "-f", "mpegts", "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError as err:
+        _LOGGER.warning("ffmpeg failed to start for the stream source: %s", err)
+        return None
+
+
+async def _copy_output(proc: asyncio.subprocess.Process, response: web.StreamResponse) -> None:
+    try:
+        while chunk := await proc.stdout.read(64 * 1024):
+            await response.write(chunk)
+    finally:
+        # Unblock the writer when the viewer left or ffmpeg stopped.
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+
+
+class _NativeStreamView(HomeAssistantView):
+    """Serves the cameras' stream sources.
+
+    Home Assistant's stream worker and go2rtc open ``stream_source()`` without
+    credentials, so that URL carries a random per-camera token. Other tools can
+    open the same stream by entity ID with a Home Assistant access token.
+    """
+
+    url = f"/api/{DOMAIN}/stream/{{key}}"
+    name = f"api:{DOMAIN}:stream"
+    requires_auth = False
+
+    def __init__(self, cameras: dict[str, NikoCamera]) -> None:
+        self._cameras = cameras
+
+    async def get(self, request: web.Request, key: str) -> web.StreamResponse:
+        camera = self._cameras.get(key)
+        if camera is None and request.get(KEY_AUTHENTICATED):
+            camera = next((c for c in self._cameras.values() if c.entity_id == key), None)
+        if camera is None:
+            return web.Response(status=404)
+        return await camera.handle_native_stream(request)

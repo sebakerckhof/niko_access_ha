@@ -36,13 +36,15 @@
           "scan_interval": "Polling-interval deurbel (seconden)",
           "camera_ip": "IP-adres buitenpost (schakelt live video in)",
           "camera_channel": "Camerakanaal",
-          "camera_quality": "Streamkwaliteit"
+          "camera_quality": "Streamkwaliteit",
+          "camera_stream": "Stream met geluid"
         },
         "data_description": {
           "lock_ids": "Leeg: één 'Deur openen'-knop per slot dat op de buitenpost is ingeschakeld. Anders bv. 3 of 1,3 (ID's 1-4: postsloten A/B, systeemrelais A/B).",
           "scan_interval": "Hoe vaak de cloud wordt gevraagd of er wordt aangebeld. Lager is sneller maar zwaarder voor de cloud.",
           "camera_ip": "LAN-IP van de buitenpost (bv. 10.6.2.6). Wordt automatisch gedetecteerd op je netwerk; leeg laten schakelt de camera uit. Home Assistant moet op hetzelfde LAN zitten. Gebruik een DHCP-reservering zodat het adres stabiel blijft.",
-          "camera_quality": "'main' = volledige resolutie (H.264 1280x720), 'sub' = lichtere substream."
+          "camera_quality": "'main' = volledige resolutie (H.264 1280x720), 'sub' = lichtere substream.",
+          "camera_stream": "Biedt ook de eigen H.264-video van de buitenpost met het geluid van de microfoon aan als stream. Home Assistant speelt de camera dan af via WebRTC of HLS, met geluid. Uit: alleen MJPEG, zoals voorheen."
         }
       }
     },
